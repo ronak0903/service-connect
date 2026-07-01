@@ -1,0 +1,306 @@
+# =============================================================================
+# buildspec.yml — AWS CodeBuild / CodePipeline
+# =============================================================================
+#
+# HOW IT WORKS
+# ─────────────────────────────────────────────────────────────────────────────
+# This single buildspec serves all three Flask microservices.
+# AWS CodePipeline is configured with an ECR source action for EACH of the
+# three repositories.  When a new image is pushed to one of those ECR repos,
+# CodePipeline fires and passes the SOURCE_EVENT_JSON environment variable
+# (set automatically by the ECR source action) that identifies which repo
+# triggered the run.
+#
+# The build phase reads that information and then:
+#   1. Pulls the task-definition JSON for ONLY the affected service.
+#   2. Updates the image URI inside the task definition to the new image tag.
+#   3. Registers a new task-definition revision.
+#   4. Updates the ECS service to use that new revision.
+#   Services that were NOT triggered are left completely untouched.
+#
+# ENVIRONMENT VARIABLES (set in the CodeBuild project or the pipeline action)
+# ─────────────────────────────────────────────────────────────────────────────
+# Required — shared
+#   AWS_DEFAULT_REGION          e.g. us-east-1
+#   ECS_CLUSTER_NAME_1          Cluster that hosts service-1 and service-2
+#   ECS_CLUSTER_NAME_2          Cluster that hosts service-3
+#
+# Required — per service (Flask App 1)
+#   ECR_REPO_URI_1              Full URI: <account>.dkr.ecr.<region>.amazonaws.com/<repo1>
+#   ECR_REPO_NAME_1             Short name used for matching: service-connect-demo-ecr-flask-app-1
+#   ECS_SERVICE_NAME_1          service-connect-demo-service-1
+#   ECS_TASK_DEF_FAMILY_1       service-connect-demo-task-def-1
+#   CONTAINER_NAME_1            flask-app-1
+#   TASK_DEF_FILE_1             service-connect-demo-task-def-1.json  (path relative to source root)
+#
+# Required — per service (Flask App 2)
+#   ECR_REPO_URI_2
+#   ECR_REPO_NAME_2             service-connect-demo-ecr-flask-app-2
+#   ECS_SERVICE_NAME_2          service-connect-demo-service-2
+#   ECS_TASK_DEF_FAMILY_2       service-connect-demo-task-def-2
+#   CONTAINER_NAME_2            flask-app-2
+#   TASK_DEF_FILE_2             service-connect-demo-task-def-2.json
+#
+# Required — per service (Flask App 3)
+#   ECR_REPO_URI_3
+#   ECR_REPO_NAME_3             service-connect-demo-ecr-flask-app-3
+#   ECS_SERVICE_NAME_3          service-connect-demo-service-3
+#   ECS_TASK_DEF_FAMILY_3       service-connect-demo-task-def-3
+#   CONTAINER_NAME_3            flask-app-3
+#   TASK_DEF_FILE_3             service-connect-demo-task-def-3.json
+# =============================================================================
+
+version: 0.2
+
+env:
+  # ── Defaults (override in the CodeBuild / Pipeline env var section) ──────
+  variables:
+    AWS_DEFAULT_REGION: "us-east-1"
+
+    # ── Cluster names ────────────────────────────────────────────────────────
+    ECS_CLUSTER_NAME_1: "service-connect-demo-cluster-1"
+    ECS_CLUSTER_NAME_2: "service-connect-demo-cluster-2"   # used by service-3
+
+    # ── Flask App 1 ───────────────────────────────────────────────────────────
+    ECR_REPO_NAME_1:       "service-connect-demo-ecr-flask-app-1"
+    ECR_REPO_URI_1:        ""   # set in CodeBuild/Pipeline env vars
+    ECS_SERVICE_NAME_1:    "service-connect-demo-service-1"
+    ECS_TASK_DEF_FAMILY_1: "service-connect-demo-task-def-1"
+    CONTAINER_NAME_1:      "flask-app-1"
+    TASK_DEF_FILE_1:       "service-connect-demo-task-def-1.json"
+
+    # ── Flask App 2 ───────────────────────────────────────────────────────────
+    ECR_REPO_NAME_2:       "service-connect-demo-ecr-flask-app-2"
+    ECR_REPO_URI_2:        ""   # set in CodeBuild/Pipeline env vars
+    ECS_SERVICE_NAME_2:    "service-connect-demo-service-2"
+    ECS_TASK_DEF_FAMILY_2: "service-connect-demo-task-def-2"
+    CONTAINER_NAME_2:      "flask-app-2"
+    TASK_DEF_FILE_2:       "service-connect-demo-task-def-2.json"
+
+    # ── Flask App 3 ───────────────────────────────────────────────────────────
+    ECR_REPO_NAME_3:       "service-connect-demo-ecr-flask-app-3"
+    ECR_REPO_URI_3:        ""   # set in CodeBuild/Pipeline env vars
+    ECS_SERVICE_NAME_3:    "service-connect-demo-service-3"
+    ECS_TASK_DEF_FAMILY_3: "service-connect-demo-task-def-3"
+    CONTAINER_NAME_3:      "flask-app-3"
+    TASK_DEF_FILE_3:       "service-connect-demo-task-def-3.json"
+
+phases:
+
+  # ── Install phase: nothing extra needed – awscli & jq ship with CodeBuild ──
+  install:
+    runtime-versions:
+      python: 3.11
+    commands:
+      - echo "=== Install phase ==="
+      - pip install --quiet --upgrade awscli
+      - jq --version   # verify jq is available (pre-installed on standard images)
+
+  # ── Pre-build: detect which ECR repo triggered the pipeline run ─────────────
+  pre_build:
+    commands:
+      - echo "=== Pre-build phase ==="
+
+      # ── Authenticate Docker to ECR ──────────────────────────────────────────
+      - |
+        aws ecr get-login-password --region "$AWS_DEFAULT_REGION" \
+          | docker login --username AWS --password-stdin \
+            "$(aws sts get-caller-identity --query Account --output text).dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+
+      # ── Determine which service was updated ────────────────────────────────
+      # CodePipeline sets the ECR_IMAGE_URI environment variable (via the
+      # "imageUri" output artifact) when an ECR source action fires.
+      # If that variable is not set (manual run / CodeBuild-only), fall back to
+      # the CODEBUILD_SOURCE_REPO_URL which contains the repo URI.
+      - |
+        if [ -z "${ECR_IMAGE_URI:-}" ]; then
+          TRIGGERED_REPO_URI="${CODEBUILD_SOURCE_REPO_URI:-}"
+        else
+          # Strip tag to get the base repo URI
+          TRIGGERED_REPO_URI="${ECR_IMAGE_URI%%:*}"
+        fi
+        echo "Triggered repo URI: $TRIGGERED_REPO_URI"
+
+      # ── Match the triggered repo to one of the three services ──────────────
+      - |
+        TRIGGERED_SERVICE=0   # 0 = unknown / no match
+
+        if echo "$TRIGGERED_REPO_URI" | grep -q "$ECR_REPO_NAME_1"; then
+          TRIGGERED_SERVICE=1
+        elif echo "$TRIGGERED_REPO_URI" | grep -q "$ECR_REPO_NAME_2"; then
+          TRIGGERED_SERVICE=2
+        elif echo "$TRIGGERED_REPO_URI" | grep -q "$ECR_REPO_NAME_3"; then
+          TRIGGERED_SERVICE=3
+        fi
+
+        echo "Matched service index: $TRIGGERED_SERVICE"
+        export TRIGGERED_SERVICE
+
+      # ── Resolve the IMAGE_URI and IMAGE_TAG for the triggered service ───────
+      - |
+        case "$TRIGGERED_SERVICE" in
+          1)
+            ACTIVE_REPO_URI="$ECR_REPO_URI_1"
+            ACTIVE_REPO_NAME="$ECR_REPO_NAME_1"
+            ACTIVE_CLUSTER="$ECS_CLUSTER_NAME_1"
+            ACTIVE_SERVICE="$ECS_SERVICE_NAME_1"
+            ACTIVE_FAMILY="$ECS_TASK_DEF_FAMILY_1"
+            ACTIVE_CONTAINER="$CONTAINER_NAME_1"
+            ACTIVE_TASK_DEF_FILE="$TASK_DEF_FILE_1"
+            ;;
+          2)
+            ACTIVE_REPO_URI="$ECR_REPO_URI_2"
+            ACTIVE_REPO_NAME="$ECR_REPO_NAME_2"
+            ACTIVE_CLUSTER="$ECS_CLUSTER_NAME_1"     # service-2 lives on cluster-1
+            ACTIVE_SERVICE="$ECS_SERVICE_NAME_2"
+            ACTIVE_FAMILY="$ECS_TASK_DEF_FAMILY_2"
+            ACTIVE_CONTAINER="$CONTAINER_NAME_2"
+            ACTIVE_TASK_DEF_FILE="$TASK_DEF_FILE_2"
+            ;;
+          3)
+            ACTIVE_REPO_URI="$ECR_REPO_URI_3"
+            ACTIVE_REPO_NAME="$ECR_REPO_NAME_3"
+            ACTIVE_CLUSTER="$ECS_CLUSTER_NAME_2"     # service-3 lives on cluster-2
+            ACTIVE_SERVICE="$ECS_SERVICE_NAME_3"
+            ACTIVE_FAMILY="$ECS_TASK_DEF_FAMILY_3"
+            ACTIVE_CONTAINER="$CONTAINER_NAME_3"
+            ACTIVE_TASK_DEF_FILE="$TASK_DEF_FILE_3"
+            ;;
+          *)
+            echo "ERROR: Could not determine which service was triggered."
+            echo "       Set ECR_IMAGE_URI or ensure CODEBUILD_SOURCE_REPO_URI matches one of:"
+            echo "       $ECR_REPO_NAME_1, $ECR_REPO_NAME_2, $ECR_REPO_NAME_3"
+            exit 1
+            ;;
+        esac
+
+        # Resolve the newest image tag pushed to that repo (the pipeline passes
+        # it via the ECR_IMAGE_URI env var; fall back to querying ECR).
+        if [ -n "${ECR_IMAGE_URI:-}" ]; then
+          IMAGE_TAG="${ECR_IMAGE_URI##*:}"
+        else
+          IMAGE_TAG=$(aws ecr describe-images \
+            --repository-name "$ACTIVE_REPO_NAME" \
+            --region "$AWS_DEFAULT_REGION" \
+            --query 'sort_by(imageDetails,&imagePushedAt)[-1].imageTags[0]' \
+            --output text)
+        fi
+
+        FULL_IMAGE_URI="${ACTIVE_REPO_URI}:${IMAGE_TAG}"
+
+        echo "Service       : $TRIGGERED_SERVICE"
+        echo "Cluster       : $ACTIVE_CLUSTER"
+        echo "ECS Service   : $ACTIVE_SERVICE"
+        echo "Task Def Family : $ACTIVE_FAMILY"
+        echo "Container name: $ACTIVE_CONTAINER"
+        echo "Image URI     : $FULL_IMAGE_URI"
+
+        # Export for the build phase
+        export ACTIVE_CLUSTER ACTIVE_SERVICE ACTIVE_FAMILY
+        export ACTIVE_CONTAINER ACTIVE_TASK_DEF_FILE FULL_IMAGE_URI
+
+        # Persist exports to a file so the build phase can source them
+        cat > /tmp/service_env.sh <<EOF
+        export TRIGGERED_SERVICE="${TRIGGERED_SERVICE}"
+        export ACTIVE_CLUSTER="${ACTIVE_CLUSTER}"
+        export ACTIVE_SERVICE="${ACTIVE_SERVICE}"
+        export ACTIVE_FAMILY="${ACTIVE_FAMILY}"
+        export ACTIVE_CONTAINER="${ACTIVE_CONTAINER}"
+        export ACTIVE_TASK_DEF_FILE="${ACTIVE_TASK_DEF_FILE}"
+        export FULL_IMAGE_URI="${FULL_IMAGE_URI}"
+        EOF
+
+  # ── Build: update task definition and deploy ────────────────────────────────
+  build:
+    commands:
+      - echo "=== Build phase ==="
+      - source /tmp/service_env.sh
+
+      # ── Step 1: Fetch the current task definition from AWS ──────────────────
+      - |
+        echo "Fetching current task definition for family: $ACTIVE_FAMILY"
+        aws ecs describe-task-definition \
+          --task-definition "$ACTIVE_FAMILY" \
+          --region "$AWS_DEFAULT_REGION" \
+          --query 'taskDefinition' \
+          --output json > /tmp/current-task-def.json
+
+        echo "Current task definition fetched."
+
+      # ── Step 2: Strip read-only fields that cannot be re-registered ─────────
+      - |
+        jq 'del(
+              .taskDefinitionArn,
+              .revision,
+              .status,
+              .requiresAttributes,
+              .compatibilities,
+              .registeredAt,
+              .registeredBy,
+              .deregisteredAt
+            )' /tmp/current-task-def.json > /tmp/clean-task-def.json
+
+      # ── Step 3: Inject the new image URI into the correct container ─────────
+      - |
+        echo "Updating image for container '$ACTIVE_CONTAINER' to '$FULL_IMAGE_URI'"
+        jq --arg containerName "$ACTIVE_CONTAINER" \
+           --arg imageUri "$FULL_IMAGE_URI" \
+          '(.containerDefinitions[] | select(.name == $containerName) | .image) = $imageUri' \
+          /tmp/clean-task-def.json > /tmp/new-task-def.json
+
+        echo "--- Updated task definition (containerDefinitions only) ---"
+        jq '.containerDefinitions[] | {name, image}' /tmp/new-task-def.json
+
+      # ── Step 4: Register the new task-definition revision ───────────────────
+      - |
+        echo "Registering new task definition revision..."
+        NEW_TASK_DEF_ARN=$(aws ecs register-task-definition \
+          --cli-input-json file:///tmp/new-task-def.json \
+          --region "$AWS_DEFAULT_REGION" \
+          --query 'taskDefinition.taskDefinitionArn' \
+          --output text)
+
+        echo "New task definition ARN: $NEW_TASK_DEF_ARN"
+        export NEW_TASK_DEF_ARN
+
+        # Persist for post_build
+        echo "export NEW_TASK_DEF_ARN='${NEW_TASK_DEF_ARN}'" >> /tmp/service_env.sh
+
+      # ── Step 5: Update the ECS service to use the new task def revision ─────
+      - |
+        source /tmp/service_env.sh   # pick up NEW_TASK_DEF_ARN
+        echo "Updating ECS service '$ACTIVE_SERVICE' in cluster '$ACTIVE_CLUSTER'..."
+        aws ecs update-service \
+          --cluster "$ACTIVE_CLUSTER" \
+          --service "$ACTIVE_SERVICE" \
+          --task-definition "$NEW_TASK_DEF_ARN" \
+          --force-new-deployment \
+          --region "$AWS_DEFAULT_REGION" \
+          --output json | jq '{
+            service:        .service.serviceName,
+            clusterArn:     .service.clusterArn,
+            taskDefinition: .service.taskDefinition,
+            desiredCount:   .service.desiredCount,
+            status:         .service.status
+          }'
+
+        echo "ECS service update triggered successfully."
+
+  # ── Post-build: summary ──────────────────────────────────────────────────────
+  post_build:
+    commands:
+      - source /tmp/service_env.sh
+      - echo "=== Post-build summary ==="
+      - echo "Triggered Service Index : $TRIGGERED_SERVICE"
+      - echo "ECS Cluster             : $ACTIVE_CLUSTER"
+      - echo "ECS Service             : $ACTIVE_SERVICE"
+      - echo "New Task Def ARN        : $NEW_TASK_DEF_ARN"
+      - echo "Image Deployed          : $FULL_IMAGE_URI"
+      - echo "Pipeline run completed successfully."
+
+# ── Artifacts: expose the updated task definition JSON ──────────────────────
+artifacts:
+  files:
+    - /tmp/new-task-def.json
+  discard-paths: yes
+  name: updated-task-definition
